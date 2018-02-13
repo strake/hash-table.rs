@@ -10,8 +10,13 @@ use core::ops::{Index, IndexMut, RangeFull};
 use core::{mem, ptr};
 use slot::Slot;
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct DefaultHasher(::sip::sip::SipHasher);
+
+impl Hasher for DefaultHasher {
+    #[inline] fn finish(&self) -> u64 { self.0.finish() }
+    #[inline] fn write(&mut self, bs: &[u8]) { self.0.write(bs) }
+}
 
 pub struct HashTable<K: Eq + Hash, T,
                      Hs: IndexMut<usize, Output = usize> + Index<RangeFull, Output = [usize]>,
