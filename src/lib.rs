@@ -1,18 +1,20 @@
 #![no_std]
 
 extern crate siphasher as sip;
+extern crate slot;
 
 use core::borrow::Borrow;
 use core::hash::{Hash, Hasher};
 use core::ops::{Index, IndexMut, RangeFull};
 use core::{mem, ptr};
+use slot::Slot;
 
 #[derive(Clone)]
 pub struct DefaultHasher(::sip::sip::SipHasher);
 
 pub struct HashTable<K: Eq + Hash, T,
                      Hs: IndexMut<usize, Output = usize> + Index<RangeFull, Output = [usize]>,
-                     Es: IndexMut<usize, Output = (K, T)>, H: Clone + Hasher = DefaultHasher> {
+                     Es: IndexMut<usize, Output = Slot<(K, T)>>, H: Clone + Hasher = DefaultHasher> {
     hashes: Hs,
     elems : Es,
     free_n: usize,
@@ -20,7 +22,7 @@ pub struct HashTable<K: Eq + Hash, T,
 }
 
 impl<K: Eq + Hash, T, Hs: IndexMut<usize, Output = usize> + Index<RangeFull, Output = [usize]>,
-     Es: IndexMut<usize, Output = (K, T)>, H: Clone + Hasher> HashTable<K, T, Hs, Es, H> {
+     Es: IndexMut<usize, Output = Slot<(K, T)>>, H: Clone + Hasher> HashTable<K, T, Hs, Es, H> {
     fn log_cap(&self) -> u32 { 0usize.count_zeros() - self.hashes[..].len().leading_zeros() - 1 }
 
     fn hash<Q: ?Sized>(&self, k: &Q) -> usize where Q: Hash {
@@ -37,7 +39,7 @@ impl<K: Eq + Hash, T, Hs: IndexMut<usize, Output = usize> + Index<RangeFull, Out
         let mut psl = 0;
         loop {
             if self.hashes[i] == 0 || psl > compute_psl(&self.hashes[..], i) { return None };
-            if self.hashes[i] == h && self.elems[i].0.borrow() == k { return Some(i); }
+            if self.hashes[i] == h && unsafe { self.elems[i].x.0.borrow() == k } { return Some(i); }
             i = (i+1)&wrap_mask;
             debug_assert_ne!(h & wrap_mask, i);
             psl += 1;
@@ -46,12 +48,12 @@ impl<K: Eq + Hash, T, Hs: IndexMut<usize, Output = usize> + Index<RangeFull, Out
 
     #[inline]
     pub fn find_with_ix<Q: ?Sized>(&self, k: &Q) -> Option<(usize, &K, &T)> where K: Borrow<Q>, Q: Eq + Hash {
-        self.find_ix(k).map(move |i| (i, &self.elems[i].0, &self.elems[i].1))
+        self.find_ix(k).map(move |i| unsafe { (i, &self.elems[i].x.0, &self.elems[i].x.1) })
     }
 
     #[inline]
     pub fn find_mut_with_ix<Q: ?Sized>(&mut self, k: &Q) -> Option<(usize, &K, &mut T)> where K: Borrow<Q>, Q: Eq + Hash {
-        self.find_ix(k).map(move |i| { let &mut (ref k, ref mut v) = &mut self.elems[i]; (i, k, v) })
+        self.find_ix(k).map(move |i| unsafe { let &mut (ref k, ref mut v) = &mut self.elems[i].x; (i, k, v) })
     }
 
     #[inline]
@@ -73,22 +75,20 @@ impl<K: Eq + Hash, T, Hs: IndexMut<usize, Output = usize> + Index<RangeFull, Out
         let mut h = self.hash(&k);
         let mut i = h&(cap-1);
         let mut psl = 0;
-        loop {
+        loop { unsafe {
             if self.hashes[i] == 0 {
                 self.hashes[i] = h;
-                unsafe { ptr::write(&mut self.elems[i], (k, f(None))); }
-                let &mut (ref k, ref mut v) = &mut self.elems[i];
+                ptr::write(&mut self.elems[i].x, (k, f(None)));
+                let &mut (ref k, ref mut v) = &mut self.elems[i].x;
                 return Ok((i, k, v))
             }
 
-            if self.hashes[i] == h && self.elems[i].0 == k {
-                unsafe {
-                    self.hashes[i] |=  dead_flag;
-                    let x = ptr::read(&self.elems[i].1);
-                    ptr::write(&mut self.elems[i].1, f(Some(x)));
-                    self.hashes[i] &= !dead_flag;
-                }
-                let &mut (ref k, ref mut v) = &mut self.elems[i];
+            if self.hashes[i] == h && self.elems[i].x.0 == k {
+                self.hashes[i] |=  dead_flag;
+                let x = ptr::read(&self.elems[i].x.1);
+                ptr::write(&mut self.elems[i].x.1, f(Some(x)));
+                self.hashes[i] &= !dead_flag;
+                let &mut (ref k, ref mut v) = &mut self.elems[i].x;
                 return Ok((i, k, v))
             }
 
@@ -96,10 +96,10 @@ impl<K: Eq + Hash, T, Hs: IndexMut<usize, Output = usize> + Index<RangeFull, Out
                 let mut e = (k, f(None));
                 loop {
                     mem::swap(&mut h, &mut self.hashes[i]);
-                    mem::swap(&mut e, &mut self.elems[i]);
+                    mem::swap(&mut e, &mut self.elems[i].x);
                     if h == 0 || is_dead(h) {
                         mem::forget(e);
-                        let &mut (ref k, ref mut v) = &mut self.elems[i];
+                        let &mut (ref k, ref mut v) = &mut self.elems[i].x;
                         return Ok((i, k, v));
                     };
                     i = (i+1)&(cap-1);
@@ -109,7 +109,7 @@ impl<K: Eq + Hash, T, Hs: IndexMut<usize, Output = usize> + Index<RangeFull, Out
             i = (i+1)&(cap-1);
             debug_assert_ne!(h&(cap-1), i);
             psl += 1;
-        }
+        } }
     }
 
     #[inline]
@@ -129,7 +129,7 @@ impl<K: Eq + Hash, T, Hs: IndexMut<usize, Output = usize> + Index<RangeFull, Out
         self.find_ix(k).map(move |i| unsafe {
             self.free_n += 1;
             debug_assert!(1 << self.log_cap() >= self.free_n);
-            let (_, x) = ptr::read(&self.elems[i]);
+            let (_, x) = ptr::read(&self.elems[i]).x;
             self.hashes[i] |= dead_flag;
             x
         })
@@ -142,3 +142,13 @@ impl<K: Eq + Hash, T, Hs: IndexMut<usize, Output = usize> + Index<RangeFull, Out
 
 const dead_flag: usize = !(!0>>1);
 const hash_flag: usize = dead_flag>>1;
+
+impl<K: Eq + Hash, T,
+     Hs: IndexMut<usize, Output = usize> + Index<RangeFull, Output = [usize]>,
+     Es: IndexMut<usize, Output = Slot<(K, T)>>, H: Clone + Hasher> Drop for HashTable<K, T, Hs, Es, H> {
+    #[inline] fn drop(&mut self) { unsafe {
+        for i in 0..self.hashes[..].len() {
+            if self.hashes[i] != 0 && !is_dead(self.hashes[i]) { ptr::drop_in_place(&mut self.elems[i].x); }
+        }
+    } }
+}
