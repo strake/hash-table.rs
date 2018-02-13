@@ -5,6 +5,7 @@ extern crate slot;
 
 use core::borrow::Borrow;
 use core::hash::{Hash, Hasher};
+use core::marker::PhantomData;
 use core::ops::{Index, IndexMut, RangeFull};
 use core::{mem, ptr};
 use slot::Slot;
@@ -134,6 +135,81 @@ impl<K: Eq + Hash, T, Hs: IndexMut<usize, Output = usize> + Index<RangeFull, Out
             x
         })
     }
+
+    #[inline]
+    pub fn iter_with_ix(&self) -> IterWithIx<K, T> {
+        IterWithIx {
+            φ: PhantomData,
+            hash_ptr: &self.hashes[0],
+            elms_ptr: &self.elems[0] as *const Slot<_> as *const _,
+            hash_end: self.hashes[..].as_ptr().wrapping_offset(self.hashes[..].len() as _),
+        }
+    }
+
+    #[inline]
+    pub fn iter_mut_with_ix(&mut self) -> IterMutWithIx<K, T> {
+        IterMutWithIx {
+            φ: PhantomData,
+            hash_ptr: &self.hashes[0],
+            elms_ptr: &mut self.elems[0] as *mut Slot<_> as *mut _,
+            hash_end: self.hashes[..].as_ptr().wrapping_offset(self.hashes[..].len() as _),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct IterWithIx<'a, K, T> {
+    φ: PhantomData<&'a ()>,
+    hash_ptr: *const usize,
+    elms_ptr: *const (K, T),
+    hash_end: *const usize,
+}
+
+impl<'a, K: 'a, T: 'a> Iterator for IterWithIx<'a, K, T> {
+    type Item = (usize, &'a K, &'a T);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut r = None;
+        while r.is_none() && self.hash_ptr != self.hash_end { unsafe {
+            if 0 != ptr::read(self.hash_ptr) { r = Some((ptr_diff(self.hash_ptr, self.hash_end),
+                                                         &(*self.elms_ptr).0,
+                                                         &(*self.elms_ptr).1)); }
+            self.hash_ptr = self.hash_ptr.wrapping_offset(1);
+            self.elms_ptr = self.elms_ptr.offset(1);
+        } }
+        r
+    }
+}
+
+unsafe impl<'a, K: Sync, T: Sync> Send for IterWithIx<'a, K, T> {}
+unsafe impl<'a, K: Sync, T: Sync> Sync for IterWithIx<'a, K, T> {}
+
+pub struct IterMutWithIx<'a, K, T> {
+    φ: PhantomData<&'a ()>,
+    hash_ptr: *const usize,
+    elms_ptr: *mut (K, T),
+    hash_end: *const usize,
+}
+
+unsafe impl<'a, K: Sync, T: Send> Send for IterMutWithIx<'a, K, T> {}
+unsafe impl<'a, K: Sync, T: Sync> Sync for IterMutWithIx<'a, K, T> {}
+
+impl<'a, K: 'a, T: 'a> Iterator for IterMutWithIx<'a, K, T> {
+    type Item = (usize, &'a K, &'a mut T);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut r = None;
+        while r.is_none() && self.hash_ptr != self.hash_end { unsafe {
+            if 0 != ptr::read(self.hash_ptr) { r = Some((ptr_diff(self.hash_ptr, self.hash_end),
+                                                         &    (*self.elms_ptr).0,
+                                                         &mut (*self.elms_ptr).1)); }
+            self.hash_ptr = self.hash_ptr.wrapping_offset(1);
+            self.elms_ptr = self.elms_ptr.offset(1);
+        } }
+        r
+    }
 }
 
 #[inline] fn compute_psl(hs: &[usize], i: usize) -> usize { usize::wrapping_sub(i, hs[i])&(hs.len()-1) }
@@ -151,4 +227,9 @@ impl<K: Eq + Hash, T,
             if self.hashes[i] != 0 && !is_dead(self.hashes[i]) { ptr::drop_in_place(&mut self.elems[i].x); }
         }
     } }
+}
+
+#[inline] pub fn ptr_diff<T>(p: *const T, q: *const T) -> usize {
+    use ::core::num::Wrapping as w;
+    (w(p as usize) - w(q as usize)).0/mem::size_of::<T>()
 }
