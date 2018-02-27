@@ -181,6 +181,9 @@ impl<K: Eq + Hash, T, Hs: IndexMut<usize, Output = usize> + Index<RangeFull, Out
             hash_end: self.hashes[..].as_ptr().wrapping_offset(self.hashes[..].len() as _),
         }
     }
+
+    #[inline]
+    pub fn hasher(&self) -> &H { &self.hasher }
 }
 
 #[derive(Clone, Copy)]
