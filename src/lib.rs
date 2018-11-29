@@ -43,6 +43,7 @@ impl<K: Eq + Hash, T, Hs: IndexMut<usize, Output = usize> + Index<RangeFull, Out
      Es: IndexMut<usize, Output = Slot<(K, T)>>, H: Clone + Hasher> HashTable<K, T, Hs, Es, H> {
     #[inline]
     pub fn from_parts(mut hashes: Hs, elems: Es, hasher: H) -> Self {
+        #[allow(clippy::needless_range_loop)]
         for k in 0..hashes[..].len() { hashes[k] = 0; }
         let free_n = 1 << log2(hashes[..].len());
         HashTable { hashes, elems, hasher, free_n }
@@ -167,7 +168,7 @@ impl<K: Eq + Hash, T, Hs: IndexMut<usize, Output = usize> + Index<RangeFull, Out
             hash_ptr: &self.hashes[0],
             elms_ptr: &self.elems[0] as *const Slot<_> as *const _,
             hash_top: &self.hashes[0],
-            hash_end: self.hashes[..].as_ptr().wrapping_offset(self.hashes[..].len() as _),
+            hash_end: self.hashes[..].as_ptr().wrapping_add(self.hashes[..].len()),
         }
     }
 
@@ -178,7 +179,7 @@ impl<K: Eq + Hash, T, Hs: IndexMut<usize, Output = usize> + Index<RangeFull, Out
             hash_ptr: &self.hashes[0],
             elms_ptr: &mut self.elems[0] as *mut Slot<_> as *mut _,
             hash_top: &self.hashes[0],
-            hash_end: self.hashes[..].as_ptr().wrapping_offset(self.hashes[..].len() as _),
+            hash_end: self.hashes[..].as_ptr().wrapping_add(self.hashes[..].len()),
         }
     }
 
