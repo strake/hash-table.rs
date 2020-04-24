@@ -158,6 +158,16 @@ impl<K: Eq + Hash, T, Hs: IndexMut<usize, Output = usize> + Index<RangeFull, Out
     }
 
     #[inline]
+    pub fn drain(&mut self) -> Drain<K, T> {
+        Drain {
+            φ: PhantomData,
+            hash_ptr: &mut self.hashes[0],
+            elms_ptr: &mut self.elems[0] as *mut Slot<_> as *mut _,
+            hash_end: (&mut self.hashes[0] as *mut usize).wrapping_add(self.hashes[..].len()),
+        }
+    }
+
+    #[inline]
     pub fn iter_with_ix(&self) -> IterWithIx<K, T> {
         IterWithIx {
             φ: PhantomData,
@@ -213,7 +223,7 @@ unsafe impl<'a, K: Sync, T: Sync> Send for IterWithIx<'a, K, T> {}
 unsafe impl<'a, K: Sync, T: Sync> Sync for IterWithIx<'a, K, T> {}
 
 pub struct IterMutWithIx<'a, K, T> {
-    φ: PhantomData<&'a ()>,
+    φ: PhantomData<&'a mut ()>,
     hash_ptr: *const usize,
     elms_ptr: *mut (K, T),
     hash_top: *const usize,
@@ -238,6 +248,39 @@ impl<'a, K: 'a, T: 'a> Iterator for IterMutWithIx<'a, K, T> {
         } }
         r
     }
+}
+
+pub struct Drain<'a, K, T> {
+    φ: PhantomData<&'a mut ()>,
+    hash_ptr: *mut usize,
+    elms_ptr: *mut (K, T),
+    hash_end: *mut usize,
+}
+
+unsafe impl<'a, K: Sync, T: Send> Send for Drain<'a, K, T> {}
+unsafe impl<'a, K: Sync, T: Sync> Sync for Drain<'a, K, T> {}
+
+impl<'a, K, T> Iterator for Drain<'a, K, T> {
+    type Item = (K, T);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut r = None;
+        while r.is_none() && self.hash_ptr != self.hash_end { unsafe {
+            if 0 != *self.hash_ptr {
+                *self.hash_ptr = 0;
+                r = Some(ptr::read(self.elms_ptr));
+            }
+            self.hash_ptr = self.hash_ptr.wrapping_offset(1);
+            self.elms_ptr = self.elms_ptr.offset(1);
+        } }
+        r
+    }
+}
+
+impl<'a, K, T> Drop for Drain<'a, K, T> {
+    #[inline]
+    fn drop(&mut self) { for _ in self {} }
 }
 
 #[inline] fn compute_psl(hs: &[usize], i: usize) -> usize { usize::wrapping_sub(i, hs[i])&(hs.len()-1) }
