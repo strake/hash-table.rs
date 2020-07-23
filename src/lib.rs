@@ -158,6 +158,28 @@ impl<K: Eq + Hash, T, Hs: IndexMut<usize, Output = usize> + Index<RangeFull, Out
     }
 
     #[inline]
+    pub fn drain(&mut self) -> Drain<K, T> {
+        DrainFilter {
+            φ: PhantomData,
+            hash_ptr: &mut self.hashes[0],
+            elms_ptr: &mut self.elems[0] as *mut Slot<_> as *mut _,
+            hash_end: (&mut self.hashes[0] as *mut usize).wrapping_add(self.hashes[..].len()),
+            f: |_, _| true,
+        }
+    }
+
+    #[inline]
+    pub fn drain_filter<F: FnMut(&K, &mut T) -> bool>(&mut self, f: F) -> DrainFilter<K, T, F> {
+        DrainFilter {
+            φ: PhantomData,
+            hash_ptr: &mut self.hashes[0],
+            elms_ptr: &mut self.elems[0] as *mut Slot<_> as *mut _,
+            hash_end: (&mut self.hashes[0] as *mut usize).wrapping_add(self.hashes[..].len()),
+            f,
+        }
+    }
+
+    #[inline]
     pub fn iter_with_ix(&self) -> IterWithIx<K, T> {
         IterWithIx {
             φ: PhantomData,
@@ -238,6 +260,45 @@ impl<'a, K: 'a, T: 'a> Iterator for IterMutWithIx<'a, K, T> {
         } }
         r
     }
+}
+
+pub type Drain<'a, K, T> = DrainFilter<'a, K, T, fn(&K, &mut T) -> bool>;
+
+pub struct DrainFilter<'a, K, T, F: FnMut(&K, &mut T) -> bool> {
+    φ: PhantomData<&'a mut ()>,
+    hash_ptr: *mut usize,
+    elms_ptr: *mut (K, T),
+    hash_end: *mut usize,
+    f: F
+}
+
+unsafe impl<'a, K: Sync, T: Send, F: FnMut(&K, &mut T) -> bool + Send> Send for DrainFilter<'a, K, T, F> {}
+unsafe impl<'a, K: Sync, T: Sync, F: FnMut(&K, &mut T) -> bool + Sync> Sync for DrainFilter<'a, K, T, F> {}
+
+impl<'a, K, T, F: FnMut(&K, &mut T) -> bool> Iterator for DrainFilter<'a, K, T, F> {
+    type Item = (K, T);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut r = None;
+        while r.is_none() && self.hash_ptr != self.hash_end { unsafe {
+            if 0 != *self.hash_ptr {
+                let (ref k, ref mut v) = &mut *self.elms_ptr;
+                if (self.f)(k, v) {
+                    *self.hash_ptr = 0;
+                    r = Some(ptr::read(self.elms_ptr));
+                }
+            }
+            self.hash_ptr = self.hash_ptr.wrapping_offset(1);
+            self.elms_ptr = self.elms_ptr.offset(1);
+        } }
+        r
+    }
+}
+
+impl<'a, K, T, F: FnMut(&K, &mut T) -> bool> Drop for DrainFilter<'a, K, T, F> {
+    #[inline]
+    fn drop(&mut self) { for _ in self {} }
 }
 
 #[inline] fn compute_psl(hs: &[usize], i: usize) -> usize { usize::wrapping_sub(i, hs[i])&(hs.len()-1) }
