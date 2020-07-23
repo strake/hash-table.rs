@@ -213,7 +213,7 @@ unsafe impl<'a, K: Sync, T: Sync> Send for IterWithIx<'a, K, T> {}
 unsafe impl<'a, K: Sync, T: Sync> Sync for IterWithIx<'a, K, T> {}
 
 pub struct IterMutWithIx<'a, K, T> {
-    φ: PhantomData<&'a ()>,
+    φ: PhantomData<&'a mut ()>,
     hash_ptr: *const usize,
     elms_ptr: *mut (K, T),
     hash_top: *const usize,
