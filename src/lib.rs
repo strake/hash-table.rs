@@ -1,7 +1,16 @@
 #![no_std]
 
+#![cfg_attr(test, feature(custom_attribute))]
+#![cfg_attr(test, feature(plugin))]
+
+#![cfg_attr(test, plugin(quickcheck_macros))]
+
 extern crate siphasher as sip;
 extern crate slot;
+
+#[cfg(test)] extern crate quickcheck;
+#[cfg(test)] #[macro_use]
+             extern crate std;
 
 use core::borrow::Borrow;
 use core::hash::{Hash, Hasher};
@@ -27,9 +36,19 @@ pub struct HashTable<K: Eq + Hash, T,
     hasher: H,
 }
 
+#[inline]
+fn log2(n: usize) -> u32 { 0usize.count_zeros() - n.leading_zeros() - 1 }
+
 impl<K: Eq + Hash, T, Hs: IndexMut<usize, Output = usize> + Index<RangeFull, Output = [usize]>,
      Es: IndexMut<usize, Output = Slot<(K, T)>>, H: Clone + Hasher> HashTable<K, T, Hs, Es, H> {
-    fn log_cap(&self) -> u32 { 0usize.count_zeros() - self.hashes[..].len().leading_zeros() - 1 }
+    #[inline]
+    pub fn from_parts(mut hashes: Hs, elems: Es, hasher: H) -> Self {
+        for k in 0..hashes[..].len() { hashes[k] = 0; }
+        let free_n = 1 << log2(hashes[..].len());
+        HashTable { hashes, elems, hasher, free_n }
+    }
+
+    fn log_cap(&self) -> u32 { log2(self.hashes[..].len()) }
 
     fn hash<Q: ?Sized>(&self, k: &Q) -> usize where Q: Hash {
         let mut h = self.hasher.clone();
@@ -237,4 +256,139 @@ impl<K: Eq + Hash, T,
 #[inline] pub fn ptr_diff<T>(p: *const T, q: *const T) -> usize {
     use ::core::num::Wrapping as w;
     (w(p as usize) - w(q as usize)).0/mem::size_of::<T>()
+}
+
+#[cfg(test)] mod tests {
+    use quickcheck::{ Arbitrary, Gen };
+    use std::hash::*;
+    use std::vec::Vec;
+
+    use super::*;
+
+    fn nub_by_0<S: Ord, T>(v: &mut Vec<(S, T)>) {
+        // Only last element of test input vector with each key is kept in table, so we must delete the others.
+        // We can not merely sort by reverse comparison rather than sort and reverse as we rely on stability.
+        v.sort_by(|&(ref i, _), &(ref j, _)| Ord::cmp(i, j));
+        v.reverse();
+        let mut i = 1;
+        while i < v.len() {
+            while i < v.len() && v[i-1].0 == v[i].0 { v.remove(i); }
+            i += 1;
+        }
+    }
+
+    fn mk_ht<K: Eq + Hash, T, H: Clone + Hasher>(cap: usize, h: H) -> HashTable<K, T, Vec<usize>, Vec<Slot<(K, T)>>, H> {
+        HashTable::from_parts(vec![0; cap], vec![Slot::new(); cap], h)
+    }
+
+    #[derive(Clone)]
+    struct XorBytesHasher(u64);
+    impl Hasher for XorBytesHasher {
+        fn finish(&self) -> u64 { match self { &XorBytesHasher(h) => h } }
+        fn write(&mut self, bs: &[u8]) {
+            for &b in bs { self.0 ^= b as u64; }
+        }
+    }
+
+    #[derive(Clone)]
+    struct NullHasher;
+    impl Hasher for NullHasher {
+        fn finish(&self) -> u64 { 0 }
+        fn write(&mut self, _: &[u8]) {}
+    }
+
+    // ¬([_; 0x100]: Copy + Clone). Grr. *irritation*
+    #[derive(Copy, Clone, Debug)]
+    struct ArrayOf0x100<T: Copy>([[T; 0x10]; 0x10]);
+    impl<T: Arbitrary + Copy> Arbitrary for ArrayOf0x100<T> {
+        fn arbitrary<G: Gen>(g: &mut G) -> Self {
+            use std::mem;
+            use std::ptr;
+            unsafe {
+                let mut a: [[T; 0x10]; 0x10] = mem::uninitialized();
+                for i in 0..0x10 { for j in 0..0x10 { ptr::write(&mut a[i][j], T::arbitrary(g)); } }
+                ArrayOf0x100(a)
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct ArrayOf0x100Hasher([[u64; 0x10]; 0x10], u64);
+    impl Hasher for ArrayOf0x100Hasher {
+        fn finish(&self) -> u64 { match self { &ArrayOf0x100Hasher(_, h) => h } }
+        fn write(&mut self, bs: &[u8]) {
+            for &b in bs { self.1 ^= self.0[b as usize >> 4][b as usize & 0x0F]; }
+        }
+    }
+
+    #[quickcheck] fn insertion_sans_collision(mut v: Vec<u64>) -> bool {
+        v.truncate(0x100);
+        let log_cap = (v.len() + 1).next_power_of_two().trailing_zeros();
+        let mut t = mk_ht::<u8, u64, _>(1 << log_cap, XorBytesHasher(0));
+        for (k, &x) in v.iter().enumerate() { t.insert(k as u8, x).unwrap(); }
+        v.iter().enumerate().all(|(k, x)| t.find(&(k as u8)) == Some((&(k as u8), &x)))
+    }
+
+    #[quickcheck] fn insertion_with_collision(mut v: Vec<(u8, u64)>) -> bool {
+        let log_cap = (v.len() + 1).next_power_of_two().trailing_zeros();
+        let mut t = mk_ht::<u8, u64, _>(1 << log_cap, NullHasher);
+        for (k, x) in v.clone() { t.insert(k, x).unwrap(); }
+
+        nub_by_0(&mut v);
+        v.iter().all(|&(k, x)| t.find(&k) == Some((&k, &x)))
+    }
+
+    #[quickcheck] fn insertion_with_random_hash(a: ArrayOf0x100<u64>, mut v: Vec<(u8, u64)>) -> bool {
+        let ArrayOf0x100(a) = a;
+
+        let log_cap = (v.len() + 1).next_power_of_two().trailing_zeros();
+        let mut t = mk_ht::<u8, u64, ArrayOf0x100Hasher>(1 << log_cap, ArrayOf0x100Hasher(a, 0));
+        for (k, x) in v.clone() { t.insert(k, x).unwrap(); }
+
+        nub_by_0(&mut v);
+        v.iter().all(|&(k, x)| t.find(&k) == Some((&k, &x)))
+    }
+
+    #[quickcheck] fn deletion_sans_collision(mut v: Vec<u64>) -> bool {
+        v.truncate(0x100);
+        let log_cap = (v.len() + 1).next_power_of_two().trailing_zeros();
+        let mut t = mk_ht::<u8, u64, _>(1 << log_cap, XorBytesHasher(0));
+        for (k, &x) in v.iter().enumerate() { t.insert(k as u8, x).unwrap(); }
+        v.iter().enumerate().all(|(k, &x)| t.find(&(k as u8)) == Some((&(k as u8), &x)) && t.delete(&(k as u8)) == Some(x) && t.find(&(k as u8)) == None)
+    }
+
+    #[quickcheck] fn deletion_with_collision(mut v: Vec<(u8, u64)>) -> bool {
+        v.truncate(8);
+        let log_cap = (v.len() + 1).next_power_of_two().trailing_zeros();
+        let mut t = mk_ht::<u8, u64, _>(1 << log_cap, NullHasher);
+        for (k, x) in v.clone() { t.insert(k, x).unwrap(); }
+
+        nub_by_0(&mut v);
+        v.iter().all(|&(k, x)| t.find(&(k as u8)) == Some((&k, &x)) && t.delete(&k) == Some(x) && t.find(&k) == None)
+    }
+
+    #[quickcheck] fn deletion_with_random_hash(a: ArrayOf0x100<u64>, mut v: Vec<(u8, u64)>) -> bool {
+        let ArrayOf0x100(a) = a;
+
+        let log_cap = (v.len() + 1).next_power_of_two().trailing_zeros();
+        let mut t = mk_ht::<u8, u64, _>(1 << log_cap, ArrayOf0x100Hasher(a, 0));
+        for (k, x) in v.clone() { t.insert(k, x).unwrap(); }
+
+        nub_by_0(&mut v);
+        v.iter().all(|&(k, x)| t.find(&k) == Some((&k, &x)) && t.delete(&k) == Some(x) && t.find(&k) == None)
+    }
+
+    #[quickcheck] fn iter(v: Vec<(u8, u64)>) -> bool {
+        let log_cap = (v.len() + 1).next_power_of_two().trailing_zeros();
+        let mut t = mk_ht::<u8, u64, _>(1 << log_cap, DefaultHasher::default());
+        for (k, x) in v.clone() { t.insert(k, x).unwrap(); }
+
+        t.iter_with_ix().all(|(_, &i, &x)| v.iter().any(|&(j, y)| (i, x) == (j, y)))
+    }
+
+    #[test] fn full_table_forbidden() {
+        let mut t = mk_ht::<u8, (), _>(2, DefaultHasher::default());
+        t.insert(0, ()).unwrap();
+        assert!(t.insert(1, ()).is_err());
+    }
 }
