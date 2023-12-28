@@ -1,14 +1,10 @@
 #![no_std]
 
-#![cfg_attr(test, feature(custom_attribute))]
-#![cfg_attr(test, feature(plugin))]
-
-#![cfg_attr(test, plugin(quickcheck_macros))]
-
 extern crate siphasher as sip;
-extern crate slot;
 
 #[cfg(test)] extern crate quickcheck;
+#[cfg(test)] #[macro_use]
+             extern crate quickcheck_macros;
 #[cfg(test)] #[macro_use]
              extern crate std;
 
@@ -17,7 +13,7 @@ use core::hash::{Hash, Hasher};
 use core::marker::PhantomData;
 use core::ops::{Index, IndexMut, RangeFull};
 use core::{mem, ptr};
-use slot::Slot;
+use core::mem::MaybeUninit as Slot;
 
 #[derive(Clone, Default)]
 pub struct DefaultHasher(::sip::sip::SipHasher);
@@ -65,7 +61,7 @@ impl<K: Eq + Hash, T, Hs: IndexMut<usize, Output = usize> + Index<RangeFull, Out
         let mut psl = 0;
         loop {
             if self.hashes[i] == 0 || psl > compute_psl(&self.hashes[..], i) { return None };
-            if self.hashes[i] == h && unsafe { self.elems[i].x.0.borrow() == k } { return Some(i); }
+            if self.hashes[i] == h && unsafe { self.elems[i].get_ref().0.borrow() == k } { return Some(i); }
             i = (i+1)&wrap_mask;
             debug_assert_ne!(h & wrap_mask, i);
             psl += 1;
@@ -74,12 +70,12 @@ impl<K: Eq + Hash, T, Hs: IndexMut<usize, Output = usize> + Index<RangeFull, Out
 
     #[inline]
     pub fn find_with_ix<Q: ?Sized>(&self, k: &Q) -> Option<(usize, &K, &T)> where K: Borrow<Q>, Q: Eq + Hash {
-        self.find_ix(k).map(move |i| unsafe { (i, &self.elems[i].x.0, &self.elems[i].x.1) })
+        self.find_ix(k).map(move |i| unsafe { (i, &self.elems[i].get_ref().0, &self.elems[i].get_ref().1) })
     }
 
     #[inline]
     pub fn find_mut_with_ix<Q: ?Sized>(&mut self, k: &Q) -> Option<(usize, &K, &mut T)> where K: Borrow<Q>, Q: Eq + Hash {
-        self.find_ix(k).map(move |i| unsafe { let &mut (ref k, ref mut v) = &mut self.elems[i].x; (i, k, v) })
+        self.find_ix(k).map(move |i| unsafe { let &mut (ref k, ref mut v) = self.elems[i].get_mut(); (i, k, v) })
     }
 
     #[inline]
@@ -104,17 +100,17 @@ impl<K: Eq + Hash, T, Hs: IndexMut<usize, Output = usize> + Index<RangeFull, Out
         loop { unsafe {
             if self.hashes[i] == 0 {
                 self.hashes[i] = h;
-                ptr::write(&mut self.elems[i].x, (k, f(None)));
-                let &mut (ref k, ref mut v) = &mut self.elems[i].x;
+                ptr::write(self.elems[i].get_mut(), (k, f(None)));
+                let &mut (ref k, ref mut v) = self.elems[i].get_mut();
                 return Ok((i, k, v))
             }
 
-            if self.hashes[i] == h && self.elems[i].x.0 == k {
+            if self.hashes[i] == h && self.elems[i].get_ref().0 == k {
                 self.hashes[i] |=  dead_flag;
-                let x = ptr::read(&self.elems[i].x.1);
-                ptr::write(&mut self.elems[i].x.1, f(Some(x)));
+                let x = ptr::read(&self.elems[i].get_ref().1);
+                ptr::write(&mut self.elems[i].get_mut().1, f(Some(x)));
                 self.hashes[i] &= !dead_flag;
-                let &mut (ref k, ref mut v) = &mut self.elems[i].x;
+                let &mut (ref k, ref mut v) = self.elems[i].get_mut();
                 return Ok((i, k, v))
             }
 
@@ -122,10 +118,10 @@ impl<K: Eq + Hash, T, Hs: IndexMut<usize, Output = usize> + Index<RangeFull, Out
                 let mut e = (k, f(None));
                 loop {
                     mem::swap(&mut h, &mut self.hashes[i]);
-                    mem::swap(&mut e, &mut self.elems[i].x);
+                    mem::swap(&mut e, self.elems[i].get_mut());
                     if h == 0 || is_dead(h) {
                         mem::forget(e);
-                        let &mut (ref k, ref mut v) = &mut self.elems[i].x;
+                        let &mut (ref k, ref mut v) = self.elems[i].get_mut();
                         return Ok((i, k, v));
                     };
                     i = (i+1)&(cap-1);
@@ -155,7 +151,7 @@ impl<K: Eq + Hash, T, Hs: IndexMut<usize, Output = usize> + Index<RangeFull, Out
         self.find_ix(k).map(move |i| unsafe {
             self.free_n += 1;
             debug_assert!(1 << self.log_cap() >= self.free_n);
-            let (_, x) = ptr::read(&self.elems[i]).x;
+            let (_, x) = ptr::read(self.elems[i].get_ref());
             self.hashes[i] |= dead_flag;
             x
         })
@@ -256,7 +252,7 @@ impl<K: Eq + Hash, T,
      Es: IndexMut<usize, Output = Slot<(K, T)>>, H: Clone + Hasher> Drop for HashTable<K, T, Hs, Es, H> {
     #[inline] fn drop(&mut self) { unsafe {
         for i in 0..self.hashes[..].len() {
-            if self.hashes[i] != 0 && !is_dead(self.hashes[i]) { ptr::drop_in_place(&mut self.elems[i].x); }
+            if self.hashes[i] != 0 && !is_dead(self.hashes[i]) { ptr::drop_in_place(self.elems[i].get_mut()); }
         }
     } }
 }
@@ -286,7 +282,9 @@ impl<K: Eq + Hash, T,
     }
 
     fn mk_ht<K: Eq + Hash, T, H: Clone + Hasher>(cap: usize, h: H) -> HashTable<K, T, Vec<usize>, Vec<Slot<(K, T)>>, H> {
-        HashTable::from_parts(vec![0; cap], vec![Slot::new(); cap], h)
+        let mut es = Vec::with_capacity(cap);
+        unsafe { es.set_len(cap) };
+        HashTable::from_parts(vec![0; cap], es, h)
     }
 
     #[derive(Clone)]
@@ -310,8 +308,6 @@ impl<K: Eq + Hash, T,
     struct ArrayOf0x100<T: Copy>([[T; 0x10]; 0x10]);
     impl<T: Arbitrary + Copy> Arbitrary for ArrayOf0x100<T> {
         fn arbitrary<G: Gen>(g: &mut G) -> Self {
-            use std::mem;
-            use std::ptr;
             unsafe {
                 let mut a: [[T; 0x10]; 0x10] = mem::uninitialized();
                 for i in 0..0x10 { for j in 0..0x10 { ptr::write(&mut a[i][j], T::arbitrary(g)); } }
